@@ -62,12 +62,15 @@ function findNearestIntersection(lat, lon, ways) {
 
 async function geocodeAddress(address) {
   const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}&limit=1&addressdetails=1`
-  const res = await fetch(url, {
-    headers: { 'User-Agent': 'AddressIntelligenceDemo/1.0' },
-  })
+  let res
+  try {
+    res = await fetch(url)
+  } catch (e) {
+    throw new Error(`Nominatim: falha na conexao (${e.message}). Verifique sua internet.`)
+  }
   if (!res.ok) throw new Error(`Nominatim HTTP ${res.status}`)
   const data = await res.json()
-  if (!data.length) throw new Error('Endereco nao encontrado no Nominatim')
+  if (!data.length) throw new Error('Endereco nao encontrado no Nominatim. Tente um endereco mais completo (ex: "Avenida Paulista, 1578, Sao Paulo, Brasil").')
   return {
     lat: parseFloat(data[0].lat),
     lon: parseFloat(data[0].lon),
@@ -88,12 +91,17 @@ async function queryOverpass(lat, lon, radius = 300) {
 out body geom;
 `
   const url = 'https://overpass-api.de/api/interpreter'
-  const res = await fetch(url, {
-    method: 'POST',
-    body: `data=${encodeURIComponent(query)}`,
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-  })
-  if (!res.ok) throw new Error(`Overpass HTTP ${res.status}`)
+  let res
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      body: `data=${encodeURIComponent(query)}`,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    })
+  } catch (e) {
+    throw new Error(`Overpass API: falha na conexao (${e.message}). O servidor pode estar sobrecarregado, tente novamente em alguns segundos.`)
+  }
+  if (!res.ok) throw new Error(`Overpass HTTP ${res.status} — servidor pode estar sobrecarregado`)
   return res.json()
 }
 
@@ -153,15 +161,33 @@ function parseOverpassResults(data, lat, lon) {
 }
 
 async function fetchElevations(points) {
+  // Try Open-Elevation first, fallback to Open Topo Data
   const locations = points.map((p) => ({ latitude: p.lat, longitude: p.lon }))
-  const res = await fetch('https://api.open-elevation.com/api/v1/lookup', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ locations }),
-  })
-  if (!res.ok) throw new Error(`Open-Elevation HTTP ${res.status}`)
-  const data = await res.json()
-  return data.results.map((r) => r.elevation)
+
+  // Attempt 1: Open-Elevation
+  try {
+    const res = await fetch('https://api.open-elevation.com/api/v1/lookup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ locations }),
+    })
+    if (res.ok) {
+      const data = await res.json()
+      if (data.results) return { elevations: data.results.map((r) => r.elevation), source: 'Open-Elevation' }
+    }
+  } catch (_) { /* fallback below */ }
+
+  // Attempt 2: Open Topo Data (free, 100 calls/day, max 100 points per call)
+  try {
+    const locStr = points.map((p) => `${p.lat},${p.lon}`).join('|')
+    const res = await fetch(`https://api.opentopodata.org/v1/srtm90m?locations=${locStr}`)
+    if (res.ok) {
+      const data = await res.json()
+      if (data.results) return { elevations: data.results.map((r) => r.elevation ?? 0), source: 'OpenTopoData/SRTM' }
+    }
+  } catch (_) { /* fallback below */ }
+
+  throw new Error('Ambas APIs de elevacao falharam (Open-Elevation e OpenTopoData). Tente novamente mais tarde.')
 }
 
 async function computeSlope(lat, lon, ways) {
@@ -193,9 +219,9 @@ async function computeSlope(lat, lon, ways) {
   }
   if (sampled.length > 15) sampled.length = 15
 
-  let elevations
+  let elevResult
   try {
-    elevations = await fetchElevations(sampled)
+    elevResult = await fetchElevations(sampled)
   } catch (e) {
     return {
       max_grade_pct: 0,
@@ -204,11 +230,12 @@ async function computeSlope(lat, lon, ways) {
       sampled_points: sampled,
       error: `Falha na API de elevacao: ${e.message}`,
       way_name: bestWay.name,
+      elevation_source: null,
     }
   }
 
   const grades = []
-  const sampledWithElev = sampled.map((p, i) => ({ ...p, elevation: elevations[i] }))
+  const sampledWithElev = sampled.map((p, i) => ({ ...p, elevation: elevResult.elevations[i] }))
   for (let i = 1; i < sampledWithElev.length; i++) {
     const prev = sampledWithElev[i - 1]
     const curr = sampledWithElev[i]
@@ -227,6 +254,7 @@ async function computeSlope(lat, lon, ways) {
     classification: classifySlope(avgGrade),
     sampled_points: sampledWithElev,
     way_name: bestWay.name,
+    elevation_source: elevResult.source,
   }
 }
 
@@ -281,7 +309,7 @@ async function analyzeAddress(address, setStatus) {
     data_quality: {
       geocoding_source: 'Nominatim/OpenStreetMap',
       osm_source: 'Overpass API',
-      elevation_source: 'Open-Elevation API',
+      elevation_source: slope.elevation_source || 'N/A (fallback)',
       warnings,
     },
     _slope_obj: slope,
