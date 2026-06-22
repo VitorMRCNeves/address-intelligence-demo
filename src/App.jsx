@@ -61,14 +61,17 @@ function findNearestIntersection(lat, lon, ways) {
 // ─── API Calls ──────────────────────────────────────────────────────────────
 
 async function geocodeAddress(address) {
-  const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}&limit=1&addressdetails=1`
+  const url = `/api/nominatim?q=${encodeURIComponent(address)}`
   let res
   try {
     res = await fetch(url)
   } catch (e) {
     throw new Error(`Nominatim: falha na conexao (${e.message}). Verifique sua internet.`)
   }
-  if (!res.ok) throw new Error(`Nominatim HTTP ${res.status}`)
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => '')
+    throw new Error(`Nominatim HTTP ${res.status}: ${errBody}`)
+  }
   const data = await res.json()
   if (!data.length) throw new Error('Endereco nao encontrado no Nominatim. Tente um endereco mais completo (ex: "Avenida Paulista, 1578, Sao Paulo, Brasil").')
   return {
@@ -90,10 +93,9 @@ async function queryOverpass(lat, lon, radius = 300) {
 );
 out body geom;
 `
-  const url = 'https://overpass-api.de/api/interpreter'
   let res
   try {
-    res = await fetch(url, {
+    res = await fetch('/api/overpass', {
       method: 'POST',
       body: `data=${encodeURIComponent(query)}`,
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -101,7 +103,10 @@ out body geom;
   } catch (e) {
     throw new Error(`Overpass API: falha na conexao (${e.message}). O servidor pode estar sobrecarregado, tente novamente em alguns segundos.`)
   }
-  if (!res.ok) throw new Error(`Overpass HTTP ${res.status} — servidor pode estar sobrecarregado`)
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => '')
+    throw new Error(`Overpass HTTP ${res.status}: ${errBody}`)
+  }
   return res.json()
 }
 
@@ -161,33 +166,29 @@ function parseOverpassResults(data, lat, lon) {
 }
 
 async function fetchElevations(points) {
-  // Try Open-Elevation first, fallback to Open Topo Data
   const locations = points.map((p) => ({ latitude: p.lat, longitude: p.lon }))
 
-  // Attempt 1: Open-Elevation
   try {
-    const res = await fetch('https://api.open-elevation.com/api/v1/lookup', {
+    const res = await fetch('/api/elevation', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ locations }),
     })
     if (res.ok) {
       const data = await res.json()
-      if (data.results) return { elevations: data.results.map((r) => r.elevation), source: 'Open-Elevation' }
+      if (data.results) {
+        return {
+          elevations: data.results.map((r) => r.elevation ?? 0),
+          source: data.source || 'Elevation API',
+        }
+      }
     }
-  } catch (_) { /* fallback below */ }
-
-  // Attempt 2: Open Topo Data (free, 100 calls/day, max 100 points per call)
-  try {
-    const locStr = points.map((p) => `${p.lat},${p.lon}`).join('|')
-    const res = await fetch(`https://api.opentopodata.org/v1/srtm90m?locations=${locStr}`)
-    if (res.ok) {
-      const data = await res.json()
-      if (data.results) return { elevations: data.results.map((r) => r.elevation ?? 0), source: 'OpenTopoData/SRTM' }
-    }
-  } catch (_) { /* fallback below */ }
-
-  throw new Error('Ambas APIs de elevacao falharam (Open-Elevation e OpenTopoData). Tente novamente mais tarde.')
+    const errBody = await res.text().catch(() => '')
+    throw new Error(`Elevation API HTTP ${res.status}: ${errBody}`)
+  } catch (e) {
+    if (e.message.includes('Elevation API HTTP')) throw e
+    throw new Error(`Elevation API: falha na conexao (${e.message})`)
+  }
 }
 
 async function computeSlope(lat, lon, ways) {
