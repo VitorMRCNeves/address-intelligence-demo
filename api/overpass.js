@@ -4,26 +4,36 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Vercel auto-parses url-encoded body into an object { data: "..." }
-    // Reconstruct the url-encoded string for the upstream request
-    let body
-    if (typeof req.body === 'object' && req.body !== null) {
-      body = new URLSearchParams(req.body).toString()
+    // Vercel auto-parses url-encoded body into { data: "..." }
+    // Extract the Overpass query and re-encode with encodeURIComponent
+    let query
+    if (typeof req.body === 'object' && req.body !== null && req.body.data) {
+      query = req.body.data
     } else if (typeof req.body === 'string') {
-      body = req.body
+      // Try to extract data= from raw string
+      const match = req.body.match(/^data=(.+)$/s)
+      query = match ? decodeURIComponent(match[1]) : req.body
     } else {
-      return res.status(400).json({ error: 'Missing body' })
+      return res.status(400).json({ error: 'Missing Overpass query in body' })
     }
+
+    const body = `data=${encodeURIComponent(query)}`
 
     const response = await fetch('https://overpass-api.de/api/interpreter', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'AddressIntelligenceDemo/1.0',
+      },
       body,
     })
 
     if (!response.ok) {
       const text = await response.text().catch(() => '')
-      return res.status(response.status).json({ error: `Overpass returned ${response.status}`, detail: text.slice(0, 500) })
+      return res.status(response.status).json({
+        error: `Overpass returned ${response.status}`,
+        detail: text.slice(0, 500),
+      })
     }
 
     const data = await response.json()
