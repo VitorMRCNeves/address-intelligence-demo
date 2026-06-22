@@ -74,10 +74,13 @@ async function geocodeAddress(address) {
   }
   const data = await res.json()
   if (!data.length) throw new Error('Endereco nao encontrado no Nominatim. Tente um endereco mais completo (ex: "Avenida Paulista, 1578, Sao Paulo, Brasil").')
+  const addr = data[0].address || {}
+  const streetName = addr.road || addr.pedestrian || addr.highway || ''
   return {
     lat: parseFloat(data[0].lat),
     lon: parseFloat(data[0].lon),
     display_name: data[0].display_name,
+    street_name: streetName,
   }
 }
 
@@ -191,32 +194,100 @@ async function fetchElevations(points) {
   }
 }
 
-async function computeSlope(lat, lon, ways) {
-  let bestWay = null
-  let bestDist = Infinity
-  for (const way of ways) {
-    if (!way.geometry || way.geometry.length < 2) continue
-    for (const pt of way.geometry) {
-      if (!pt || pt.lat == null) continue
-      const d = haversineDistance(lat, lon, pt.lat, pt.lon)
-      if (d < bestDist) {
-        bestDist = d
-        bestWay = way
-      }
+// Helper: find the minimum distance from a point to a polyline (way geometry)
+function pointToWayDistance(lat, lon, geom) {
+  let minDist = Infinity
+  for (const pt of geom) {
+    if (!pt || pt.lat == null) continue
+    const d = haversineDistance(lat, lon, pt.lat, pt.lon)
+    if (d < minDist) minDist = d
+  }
+  return minDist
+}
+
+// Helper: compute total length of a way's geometry
+function wayTotalLength(geom) {
+  let total = 0
+  for (let i = 1; i < geom.length; i++) {
+    if (!geom[i] || !geom[i - 1]) continue
+    total += haversineDistance(geom[i - 1].lat, geom[i - 1].lon, geom[i].lat, geom[i].lon)
+  }
+  return total
+}
+
+// Select the best way: prefer matching street name from geocoding, then closest navigable road
+function selectBestWay(lat, lon, ways, streetName) {
+  const validWays = ways.filter((w) => w.geometry && w.geometry.length >= 2)
+  if (!validWays.length) return null
+
+  // Normalize for comparison
+  const normalize = (s) => (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim()
+  const targetName = normalize(streetName)
+
+  // Score each way: name match is strongly preferred, then distance, then road type
+  const mainRoadTypes = new Set(['primary', 'secondary', 'tertiary', 'trunk', 'residential', 'living_street', 'unclassified'])
+
+  const scored = validWays.map((way) => {
+    const dist = pointToWayDistance(lat, lon, way.geometry)
+    const nameMatch = targetName && normalize(way.name).includes(targetName) ? 1 : 0
+    const isMainRoad = mainRoadTypes.has(way.highway) ? 1 : 0
+    const length = wayTotalLength(way.geometry.filter((p) => p && p.lat != null))
+    // Prefer: name match (huge bonus) > main road > closer > longer geometry
+    const score = nameMatch * 10000 + isMainRoad * 100 + (1000 - Math.min(dist, 1000)) + Math.min(length, 500) * 0.1
+    return { way, dist, score, nameMatch, length }
+  })
+
+  scored.sort((a, b) => b.score - a.score)
+  return scored[0]
+}
+
+// Sample points along a way at roughly even spacing, ensuring minimum distance between points
+function sampleWayPoints(geom, targetCount = 10, minSpacing = 50) {
+  const clean = geom.filter((p) => p && p.lat != null)
+  if (clean.length < 2) return clean
+
+  // Compute cumulative distances
+  const cumDist = [0]
+  for (let i = 1; i < clean.length; i++) {
+    cumDist.push(cumDist[i - 1] + haversineDistance(clean[i - 1].lat, clean[i - 1].lon, clean[i].lat, clean[i].lon))
+  }
+  const totalLen = cumDist[cumDist.length - 1]
+
+  // Use larger of: even spacing for targetCount, or minSpacing
+  const spacing = Math.max(totalLen / targetCount, minSpacing)
+  const sampled = [clean[0]]
+  let nextDist = spacing
+
+  for (let i = 1; i < clean.length; i++) {
+    if (cumDist[i] >= nextDist) {
+      sampled.push(clean[i])
+      nextDist = cumDist[i] + spacing
     }
   }
-  if (!bestWay || bestWay.geometry.length < 2) {
+
+  // Always include last point
+  const last = clean[clean.length - 1]
+  const lastSampled = sampled[sampled.length - 1]
+  if (haversineDistance(lastSampled.lat, lastSampled.lon, last.lat, last.lon) > minSpacing * 0.5) {
+    sampled.push(last)
+  }
+
+  return sampled
+}
+
+async function computeSlope(lat, lon, ways, streetName) {
+  const selected = selectBestWay(lat, lon, ways, streetName)
+  if (!selected) {
     return { max_grade_pct: 0, avg_grade_pct: 0, classification: classifySlope(0), sampled_points: [], error: 'Nenhuma via com geometria encontrada' }
   }
 
+  const bestWay = selected.way
   const geom = bestWay.geometry.filter((p) => p && p.lat != null)
-  const step = Math.max(1, Math.floor(geom.length / 8))
-  const sampled = []
-  for (let i = 0; i < geom.length; i += step) {
-    sampled.push({ lat: geom[i].lat, lon: geom[i].lon })
-  }
+
+  // Sample points with minimum 50m spacing to avoid SRTM noise
+  const sampled = sampleWayPoints(geom, 10, 50).map((p) => ({ lat: p.lat, lon: p.lon }))
   if (sampled.length < 2) {
-    sampled.push({ lat: geom[geom.length - 1].lat, lon: geom[geom.length - 1].lon })
+    return { max_grade_pct: 0, avg_grade_pct: 0, classification: classifySlope(0), sampled_points: sampled, error: 'Via muito curta para calcular inclinacao', way_name: bestWay.name, elevation_source: null }
   }
   if (sampled.length > 15) sampled.length = 15
 
@@ -235,19 +306,33 @@ async function computeSlope(lat, lon, ways) {
     }
   }
 
-  const grades = []
   const sampledWithElev = sampled.map((p, i) => ({ ...p, elevation: elevResult.elevations[i] }))
+
+  // Calculate grades only for segments >= 30m (reduce SRTM noise)
+  const grades = []
   for (let i = 1; i < sampledWithElev.length; i++) {
     const prev = sampledWithElev[i - 1]
     const curr = sampledWithElev[i]
     const dist = haversineDistance(prev.lat, prev.lon, curr.lat, curr.lon)
-    if (dist > 0.5) {
+    if (dist >= 30) {
       grades.push(calculateSlope(prev.elevation, curr.elevation, dist))
     }
   }
 
-  const maxGrade = grades.length ? Math.max(...grades) : 0
-  const avgGrade = grades.length ? grades.reduce((a, b) => a + b, 0) / grades.length : 0
+  // Also compute end-to-end slope (most robust against noise)
+  const first = sampledWithElev[0]
+  const last = sampledWithElev[sampledWithElev.length - 1]
+  const totalDist = haversineDistance(first.lat, first.lon, last.lat, last.lon)
+  const endToEndGrade = totalDist > 10 ? calculateSlope(first.elevation, last.elevation, totalDist) : 0
+
+  // Use weighted average: end-to-end (robust) + segment average (detail)
+  const segmentAvg = grades.length ? grades.reduce((a, b) => a + b, 0) / grades.length : 0
+  const maxGrade = grades.length ? Math.max(...grades) : endToEndGrade
+
+  // Weight end-to-end more heavily as it's less susceptible to noise
+  const avgGrade = grades.length >= 2
+    ? endToEndGrade * 0.6 + segmentAvg * 0.4
+    : endToEndGrade
 
   return {
     max_grade_pct: Math.round(maxGrade * 100) / 100,
@@ -255,6 +340,9 @@ async function computeSlope(lat, lon, ways) {
     classification: classifySlope(avgGrade),
     sampled_points: sampledWithElev,
     way_name: bestWay.name,
+    way_matched_by_name: selected.nameMatch === 1,
+    way_distance_m: Math.round(selected.dist),
+    end_to_end_grade_pct: Math.round(endToEndGrade * 100) / 100,
     elevation_source: elevResult.source,
   }
 }
@@ -272,7 +360,7 @@ async function analyzeAddress(address, setStatus) {
   const { bars, busStops, ways } = parseOverpassResults(overpassData, geo.lat, geo.lon)
 
   setStatus('Calculando inclinacao (consultando elevacao)...')
-  const slope = await computeSlope(geo.lat, geo.lon, ways)
+  const slope = await computeSlope(geo.lat, geo.lon, ways, geo.street_name)
   if (slope.error) warnings.push(slope.error)
 
   setStatus('Identificando intersecoes...')
@@ -289,9 +377,12 @@ async function analyzeAddress(address, setStatus) {
     street_slope: {
       max_grade_pct: slope.max_grade_pct,
       avg_grade_pct: slope.avg_grade_pct,
+      end_to_end_grade_pct: slope.end_to_end_grade_pct ?? null,
       classification: slope.classification.label,
       sampled_points: slope.sampled_points,
       way_name: slope.way_name || null,
+      way_matched_by_name: slope.way_matched_by_name ?? false,
+      way_distance_m: slope.way_distance_m ?? null,
     },
     nearby_bars: {
       count_300m: bars.length,
@@ -482,12 +573,22 @@ export default function App() {
                   <span className="text-4xl">{slopeInfo.emoji}</span>
                   <p className={`text-xl font-bold mt-1 ${slopeInfo.color}`}>{slopeInfo.label}</p>
                   {result.street_slope.way_name && (
-                    <p className="text-xs text-gray-500 mt-1">Via: {result.street_slope.way_name}</p>
+                    <p className="text-xs text-gray-500 mt-1">
+                      Via: {result.street_slope.way_name}
+                      {result.street_slope.way_matched_by_name && <span className="text-green-500 ml-1">(nome ok)</span>}
+                      {!result.street_slope.way_matched_by_name && <span className="text-yellow-500 ml-1">(via mais proxima)</span>}
+                    </p>
                   )}
                 </div>
-                <StatRow label="Inclinacao media" value={`${result.street_slope.avg_grade_pct}%`} />
-                <StatRow label="Inclinacao maxima" value={`${result.street_slope.max_grade_pct}%`} />
-                <StatRow label="Pontos amostrados" value={result.street_slope.sampled_points.length} />
+                <StatRow label="Inclinacao media (ponderada)" value={`${result.street_slope.avg_grade_pct}%`} />
+                <StatRow label="Inclinacao ponta-a-ponta" value={result.street_slope.end_to_end_grade_pct != null ? `${result.street_slope.end_to_end_grade_pct}%` : 'N/D'} />
+                <StatRow label="Inclinacao maxima (segmento)" value={`${result.street_slope.max_grade_pct}%`} />
+                <StatRow label="Pontos amostrados" value={result.street_slope.sampled_points.length} sub={`(min 50m entre pontos)`} />
+                {result.street_slope.sampled_points.length >= 2 && (
+                  <div className="mt-2 text-xs text-gray-500">
+                    Elevacao: {result.street_slope.sampled_points[0]?.elevation}m → {result.street_slope.sampled_points[result.street_slope.sampled_points.length - 1]?.elevation}m
+                  </div>
+                )}
                 {result._slope_obj.error && (
                   <p className="text-xs text-yellow-500 mt-2">⚠️ {result._slope_obj.error}</p>
                 )}
