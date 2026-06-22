@@ -19,9 +19,9 @@ function calculateSlope(elevA, elevB, distMeters) {
 }
 
 function classifySlope(gradePct) {
-  if (gradePct <= 1) return { label: 'Plana', color: 'text-green-400', emoji: '🟢' }
-  if (gradePct <= 3) return { label: 'Leve inclinacao', color: 'text-yellow-400', emoji: '🟡' }
-  if (gradePct <= 6) return { label: 'Inclinada', color: 'text-orange-400', emoji: '🟠' }
+  if (gradePct <= 3) return { label: 'Plana', color: 'text-green-400', emoji: '🟢' }
+  if (gradePct <= 6) return { label: 'Leve inclinacao', color: 'text-yellow-400', emoji: '🟡' }
+  if (gradePct <= 10) return { label: 'Inclinada', color: 'text-orange-400', emoji: '🟠' }
   return { label: 'Muito inclinada', color: 'text-red-400', emoji: '🔴' }
 }
 
