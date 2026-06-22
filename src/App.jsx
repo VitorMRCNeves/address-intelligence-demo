@@ -347,6 +347,29 @@ async function computeSlope(lat, lon, ways, streetName) {
   }
 }
 
+// ─── Favelas / Comunidades (IBGE Censo 2022) ──────────────────────────────
+
+let _favelasCache = null
+
+async function loadFavelas() {
+  if (_favelasCache) return _favelasCache
+  const res = await fetch('/favelas_bh.json')
+  if (!res.ok) throw new Error('Falha ao carregar dados de favelas')
+  _favelasCache = await res.json()
+  return _favelasCache
+}
+
+function findNearestFavelas(lat, lon, favelas, limit = 5) {
+  const withDist = favelas.map((f) => ({
+    name: f.n,
+    lat: f.lat,
+    lon: f.lon,
+    distance_m: Math.round(haversineDistance(lat, lon, f.lat, f.lon)),
+  }))
+  withDist.sort((a, b) => a.distance_m - b.distance_m)
+  return withDist.slice(0, limit)
+}
+
 // ─── Main Analysis ──────────────────────────────────────────────────────────
 
 async function analyzeAddress(address, setStatus) {
@@ -366,6 +389,15 @@ async function analyzeAddress(address, setStatus) {
   setStatus('Identificando intersecoes...')
   const nearestInt = findNearestIntersection(geo.lat, geo.lon, ways)
   const cornerDist = nearestInt ? Math.round(nearestInt.distance_m) : null
+
+  let nearestFavelas = []
+  try {
+    setStatus('Verificando proximidade de favelas/comunidades...')
+    const favelas = await loadFavelas()
+    nearestFavelas = findNearestFavelas(geo.lat, geo.lon, favelas)
+  } catch (e) {
+    warnings.push(`Dados de favelas indisponiveis: ${e.message}`)
+  }
 
   const allRoutes = new Set()
   busStops.forEach((s) => s.routes.forEach((r) => allRoutes.add(r)))
@@ -394,6 +426,11 @@ async function analyzeAddress(address, setStatus) {
       routes: allRoutes.size ? [...allRoutes] : ['Linhas nao disponiveis no OSM'],
       stops: busStops.slice(0, 10),
     },
+    favelas: {
+      nearest: nearestFavelas,
+      closest_name: nearestFavelas.length ? nearestFavelas[0].name : null,
+      closest_distance_m: nearestFavelas.length ? nearestFavelas[0].distance_m : null,
+    },
     corner: {
       distance_to_nearest_intersection_m: cornerDist,
       is_near_corner: cornerDist !== null && cornerDist <= 50,
@@ -411,9 +448,9 @@ async function analyzeAddress(address, setStatus) {
 // ─── React Component ────────────────────────────────────────────────────────
 
 const EXAMPLE_ADDRESSES = [
+  'Praca da Liberdade, Belo Horizonte, Brasil',
+  'Avenida Afonso Pena, 1000, Belo Horizonte, Brasil',
   'Avenida Paulista, 1578, Sao Paulo, Brasil',
-  'Rua Augusta, 2000, Sao Paulo, Brasil',
-  'Rua Oscar Freire, 379, Sao Paulo, Brasil',
   'Copacabana, Rio de Janeiro, Brasil',
 ]
 
@@ -613,6 +650,63 @@ export default function App() {
                 <StatRow label="Limite (perto)" value="<= 50m" />
               </Card>
 
+              {/* Favelas Card */}
+              <Card title="Favelas / Comunidades" emoji="🏘️">
+                {result.favelas.nearest.length > 0 ? (
+                  <>
+                    <div className="text-center mb-4">
+                      <span className="text-4xl">
+                        {result.favelas.closest_distance_m <= 500 ? '🔴' : result.favelas.closest_distance_m <= 1500 ? '🟡' : '🟢'}
+                      </span>
+                      <p className={`text-xl font-bold mt-1 ${
+                        result.favelas.closest_distance_m <= 500
+                          ? 'text-red-400'
+                          : result.favelas.closest_distance_m <= 1500
+                            ? 'text-yellow-400'
+                            : 'text-green-400'
+                      }`}>
+                        {result.favelas.closest_distance_m <= 500
+                          ? 'Muito proximo'
+                          : result.favelas.closest_distance_m <= 1500
+                            ? 'Proximidade moderada'
+                            : 'Distante'}
+                      </p>
+                      <p className="text-xs text-gray-500 mt-1">Fonte: IBGE Censo 2022 (FCU) — BH</p>
+                    </div>
+                    <StatRow label="Mais proxima" value={result.favelas.closest_name} />
+                    <StatRow
+                      label="Distancia"
+                      value={result.favelas.closest_distance_m >= 1000
+                        ? `${(result.favelas.closest_distance_m / 1000).toFixed(1)} km`
+                        : `${result.favelas.closest_distance_m} m`
+                      }
+                    />
+                    <div className="mt-3 max-h-52 overflow-y-auto">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="text-gray-500 text-xs">
+                            <th className="text-left pb-2">Comunidade</th>
+                            <th className="text-right pb-2">Dist.</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {result.favelas.nearest.map((fav, i) => (
+                            <tr key={i} className="border-t border-gray-700/30">
+                              <td className="py-1.5 text-gray-300">{fav.name}</td>
+                              <td className="py-1.5 text-right text-gray-400 font-mono">
+                                {fav.distance_m >= 1000 ? `${(fav.distance_m / 1000).toFixed(1)}km` : `${fav.distance_m}m`}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                ) : (
+                  <p className="text-gray-500 text-sm">Dados de favelas nao disponiveis para esta regiao</p>
+                )}
+              </Card>
+
               {/* Bars Card */}
               <Card title="Bares Proximos (300m)" emoji="🍺" className="md:col-span-1">
                 <StatRow label="Total encontrados" value={result.nearby_bars.count_300m} />
@@ -683,7 +777,7 @@ export default function App() {
 
             {/* Data Quality */}
             <Card title="Qualidade dos Dados" emoji="📊">
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-sm">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-sm">
                 <div>
                   <p className="text-gray-500 text-xs">Geocoding</p>
                   <p className="text-gray-300">{result.data_quality.geocoding_source}</p>
@@ -695,6 +789,10 @@ export default function App() {
                 <div>
                   <p className="text-gray-500 text-xs">Elevacao</p>
                   <p className="text-gray-300">{result.data_quality.elevation_source}</p>
+                </div>
+                <div>
+                  <p className="text-gray-500 text-xs">Favelas/Comunidades</p>
+                  <p className="text-gray-300">IBGE Censo 2022 (FCU)</p>
                 </div>
               </div>
               {result.data_quality.warnings.length > 0 && (
