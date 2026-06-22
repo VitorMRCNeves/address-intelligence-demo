@@ -84,15 +84,48 @@ async function geocodeAddress(address) {
   }
 }
 
+const POI_CATEGORIES = [
+  { key: 'pharmacy', label: 'Farmacias', emoji: '💊', amenity: 'pharmacy' },
+  { key: 'supermarket', label: 'Supermercados', emoji: '🛒', shop: 'supermarket' },
+  { key: 'bakery', label: 'Padarias', emoji: '🥖', shop: 'bakery' },
+  { key: 'restaurant', label: 'Restaurantes', emoji: '🍽️', amenity: 'restaurant' },
+  { key: 'hairdresser', label: 'Cabeleireiros', emoji: '💇', shop: 'hairdresser' },
+  { key: 'barber', label: 'Barbearias', emoji: '✂️', shop: 'barber' },
+  { key: 'gym', label: 'Academias', emoji: '🏋️', leisure: 'fitness_centre' },
+  { key: 'school', label: 'Escolas', emoji: '🏫', amenity: 'school' },
+  { key: 'bank', label: 'Bancos', emoji: '🏦', amenity: 'bank' },
+  { key: 'clinic', label: 'Clinicas/Saude', emoji: '🏥', amenity: 'clinic' },
+]
+
 async function queryOverpass(lat, lon, radius = 300) {
+  const poiRadius = 800
   const query = `
-[out:json][timeout:30];
+[out:json][timeout:45];
 (
   node["amenity"~"bar|pub"](around:${radius},${lat},${lon});
   way["amenity"~"bar|pub"](around:${radius},${lat},${lon});
   node["highway"="bus_stop"](around:${radius},${lat},${lon});
   node["public_transport"~"platform|stop_position"](around:${radius},${lat},${lon});
   way["highway"~"^(residential|primary|secondary|tertiary|trunk|motorway|unclassified|living_street|pedestrian|service|footway|cycleway|track|path)$"](around:${radius},${lat},${lon});
+  node["amenity"="pharmacy"](around:${poiRadius},${lat},${lon});
+  way["amenity"="pharmacy"](around:${poiRadius},${lat},${lon});
+  node["shop"="supermarket"](around:${poiRadius},${lat},${lon});
+  way["shop"="supermarket"](around:${poiRadius},${lat},${lon});
+  node["shop"="bakery"](around:${poiRadius},${lat},${lon});
+  way["shop"="bakery"](around:${poiRadius},${lat},${lon});
+  node["amenity"="restaurant"](around:${poiRadius},${lat},${lon});
+  way["amenity"="restaurant"](around:${poiRadius},${lat},${lon});
+  node["shop"="hairdresser"](around:${poiRadius},${lat},${lon});
+  node["shop"="barber"](around:${poiRadius},${lat},${lon});
+  node["leisure"="fitness_centre"](around:${poiRadius},${lat},${lon});
+  way["leisure"="fitness_centre"](around:${poiRadius},${lat},${lon});
+  node["amenity"="school"](around:${poiRadius},${lat},${lon});
+  way["amenity"="school"](around:${poiRadius},${lat},${lon});
+  node["amenity"="bank"](around:${poiRadius},${lat},${lon});
+  node["amenity"="clinic"](around:${poiRadius},${lat},${lon});
+  way["amenity"="clinic"](around:${poiRadius},${lat},${lon});
+  node["amenity"="hospital"](around:${poiRadius},${lat},${lon});
+  way["amenity"="hospital"](around:${poiRadius},${lat},${lon});
 );
 out body geom;
 `
@@ -113,17 +146,36 @@ out body geom;
   return res.json()
 }
 
+function classifyElement(tags) {
+  if (tags.amenity === 'bar' || tags.amenity === 'pub') return 'bar'
+  if (tags.highway === 'bus_stop' || tags.public_transport === 'platform' || tags.public_transport === 'stop_position') return 'bus_stop'
+  if (tags.amenity === 'pharmacy') return 'pharmacy'
+  if (tags.shop === 'supermarket') return 'supermarket'
+  if (tags.shop === 'bakery') return 'bakery'
+  if (tags.amenity === 'restaurant') return 'restaurant'
+  if (tags.shop === 'hairdresser') return 'hairdresser'
+  if (tags.shop === 'barber') return 'barber'
+  if (tags.leisure === 'fitness_centre') return 'gym'
+  if (tags.amenity === 'school') return 'school'
+  if (tags.amenity === 'bank') return 'bank'
+  if (tags.amenity === 'clinic' || tags.amenity === 'hospital') return 'clinic'
+  return null
+}
+
 function parseOverpassResults(data, lat, lon) {
   const bars = []
   const busStops = []
   const ways = []
+  const pois = {}
+  for (const cat of POI_CATEGORIES) pois[cat.key] = []
 
   for (const el of data.elements) {
     const tags = el.tags || {}
     const elLat = el.lat ?? el.center?.lat ?? el.geometry?.[0]?.lat
     const elLon = el.lon ?? el.center?.lon ?? el.geometry?.[0]?.lon
+    const cls = classifyElement(tags)
 
-    if (tags.amenity === 'bar' || tags.amenity === 'pub') {
+    if (cls === 'bar') {
       if (elLat != null && elLon != null) {
         bars.push({
           name: tags.name || `${tags.amenity} (sem nome)`,
@@ -133,13 +185,7 @@ function parseOverpassResults(data, lat, lon) {
           type: tags.amenity,
         })
       }
-    }
-
-    if (
-      tags.highway === 'bus_stop' ||
-      tags.public_transport === 'platform' ||
-      tags.public_transport === 'stop_position'
-    ) {
+    } else if (cls === 'bus_stop') {
       if (elLat != null && elLon != null) {
         const routes = tags.route_ref || tags.ref || null
         busStops.push({
@@ -150,6 +196,11 @@ function parseOverpassResults(data, lat, lon) {
           routes: routes ? routes.split(';').map((r) => r.trim()) : [],
         })
       }
+    } else if (cls && pois[cls] && elLat != null && elLon != null) {
+      pois[cls].push({
+        name: tags.name || tags.brand || '(sem nome)',
+        distance_m: Math.round(haversineDistance(lat, lon, elLat, elLon)),
+      })
     }
 
     if (el.type === 'way' && tags.highway) {
@@ -165,7 +216,8 @@ function parseOverpassResults(data, lat, lon) {
 
   bars.sort((a, b) => a.distance_m - b.distance_m)
   busStops.sort((a, b) => a.distance_m - b.distance_m)
-  return { bars, busStops, ways }
+  for (const key of Object.keys(pois)) pois[key].sort((a, b) => a.distance_m - b.distance_m)
+  return { bars, busStops, ways, pois }
 }
 
 async function fetchElevations(points) {
@@ -378,9 +430,9 @@ async function analyzeAddress(address, setStatus) {
   setStatus('Geocodificando endereco...')
   const geo = await geocodeAddress(address)
 
-  setStatus('Consultando OpenStreetMap (Overpass)...')
+  setStatus('Consultando OpenStreetMap (Overpass) — POIs, servicos e vias...')
   const overpassData = await queryOverpass(geo.lat, geo.lon)
-  const { bars, busStops, ways } = parseOverpassResults(overpassData, geo.lat, geo.lon)
+  const { bars, busStops, ways, pois } = parseOverpassResults(overpassData, geo.lat, geo.lon)
 
   setStatus('Calculando inclinacao (consultando elevacao)...')
   const slope = await computeSlope(geo.lat, geo.lon, ways, geo.street_name)
@@ -426,6 +478,18 @@ async function analyzeAddress(address, setStatus) {
       routes: allRoutes.size ? [...allRoutes] : ['Linhas nao disponiveis no OSM'],
       stops: busStops.slice(0, 10),
     },
+    services: POI_CATEGORIES.map((cat) => {
+      const items = pois[cat.key] || []
+      return {
+        key: cat.key,
+        label: cat.label,
+        emoji: cat.emoji,
+        count: items.length,
+        nearest_m: items.length ? items[0].distance_m : null,
+        nearest_name: items.length ? items[0].name : null,
+        items: items.slice(0, 5),
+      }
+    }),
     favelas: {
       nearest: nearestFavelas,
       closest_name: nearestFavelas.length ? nearestFavelas[0].name : null,
@@ -774,6 +838,50 @@ export default function App() {
                 )}
               </Card>
             </div>
+
+            {/* Services & Commerce */}
+            {result.services && (
+              <Card title="Servicos e Comercio (800m)" emoji="🏪">
+                {(() => {
+                  const found = result.services.filter((s) => s.count > 0).length
+                  const total = result.services.length
+                  const score = Math.round((found / total) * 10)
+                  const scoreColor = score >= 7 ? 'text-green-400' : score >= 4 ? 'text-yellow-400' : 'text-red-400'
+                  const scoreLabel = score >= 7 ? 'Excelente' : score >= 4 ? 'Razoavel' : 'Limitado'
+                  return (
+                    <>
+                      <div className="flex items-center justify-between mb-4 pb-3 border-b border-gray-700/30">
+                        <div>
+                          <span className="text-sm text-gray-400">Indice de conveniencia</span>
+                          <p className={`text-2xl font-bold ${scoreColor}`}>{score}/10 <span className="text-sm font-normal">{scoreLabel}</span></p>
+                        </div>
+                        <div className="text-right text-sm text-gray-400">
+                          <span className="text-gray-200 font-medium">{found}</span>/{total} categorias encontradas
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1">
+                        {result.services.map((svc) => (
+                          <div key={svc.key} className="flex items-center justify-between py-1.5 border-b border-gray-700/20 last:border-0">
+                            <div className="flex items-center gap-2 min-w-0">
+                              <span className="text-base flex-shrink-0">{svc.emoji}</span>
+                              <span className="text-sm text-gray-300 truncate">{svc.label}</span>
+                            </div>
+                            {svc.count > 0 ? (
+                              <div className="flex items-center gap-2 flex-shrink-0 ml-2">
+                                <span className="text-xs text-gray-500">{svc.count}x</span>
+                                <span className="text-sm text-green-400 font-mono">{svc.nearest_m}m</span>
+                              </div>
+                            ) : (
+                              <span className="text-sm text-gray-600 flex-shrink-0 ml-2">--</span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )
+                })()}
+              </Card>
+            )}
 
             {/* Data Quality */}
             <Card title="Qualidade dos Dados" emoji="📊">
